@@ -1,218 +1,620 @@
 // ════════════════════════════════════════════════════
-//  HepatitCheck Backend — server.js
-//  Node.js + Express + Anthropic Claude API
+// HepatitCheck Backend v3.0
+// Production Ready
+// Author: Akrom Komiljonov
 // ════════════════════════════════════════════════════
 
 require('dotenv').config();
-const express    = require('express');
-const cors       = require('cors');
-const rateLimit  = require('express-rate-limit');
-const Anthropic  = require('@anthropic-ai/sdk');
 
-const app  = express();
-const port = process.env.PORT || 3000;
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const Anthropic = require('@anthropic-ai/sdk');
 
-// ── Anthropic client ──────────────────────────────
+const app = express();
+
+// ───────────────────────────────────────────────────
+// Configuration
+// ───────────────────────────────────────────────────
+
+const PORT = Number(process.env.PORT) || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+const SUPPORTED_LANGUAGES = ['uz', 'ru', 'en'];
+
+const REQUIRED_ENV_VARS = [
+  'ANTHROPIC_API_KEY'
+];
+
+// ───────────────────────────────────────────────────
+// Environment Validation
+// ───────────────────────────────────────────────────
+
+const missingEnvVars = REQUIRED_ENV_VARS.filter(
+  key => !process.env[key]
+);
+
+if (missingEnvVars.length > 0) {
+  console.error(
+    `❌ Missing environment variables: ${missingEnvVars.join(', ')}`
+  );
+  process.exit(1);
+}
+
+// ───────────────────────────────────────────────────
+// Anthropic Client
+// ───────────────────────────────────────────────────
+
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// ── CORS ──────────────────────────────────────────
-// Faqat o'z saytingizdan kelgan so'rovlarni qabul qiladi
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+// ───────────────────────────────────────────────────
+// Security
+// ───────────────────────────────────────────────────
+
+app.disable('x-powered-by');
+
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+// ───────────────────────────────────────────────────
+// JSON Parser
+// ───────────────────────────────────────────────────
+
+app.use(
+  express.json({
+    limit: '20kb',
+  })
+);
+
+// ───────────────────────────────────────────────────
+// CORS Configuration
+// ───────────────────────────────────────────────────
+
+const ALLOWED_ORIGINS = (
+  process.env.ALLOWED_ORIGINS || ''
+)
   .split(',')
-  .map(o => o.trim())
+  .map(origin => origin.trim())
   .filter(Boolean);
 
-app.use(cors({
-  origin: (origin, cb) => {
-    // curl / Postman (origin yo'q) — development uchun
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
-      return cb(null, true);
-    }
-    cb(new Error(`CORS: ${origin} ruxsatsiz`));
-  },
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type'],
-}));
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
 
-app.use(express.json({ limit: '10kb' }));
+      if (
+        ALLOWED_ORIGINS.length === 0 ||
+        ALLOWED_ORIGINS.includes(origin)
+      ) {
+        return callback(null, true);
+      }
 
-// ── Rate limiting ──────────────────────────────────
-// Har bir IP dan 1 daqiqada max 20 ta so'rov
-const limiter = rateLimit({
+      return callback(
+        new Error(`Origin not allowed: ${origin}`)
+      );
+    },
+
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type'],
+    credentials: false,
+  })
+);
+
+// ───────────────────────────────────────────────────
+// Rate Limiter
+// ───────────────────────────────────────────────────
+
+const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+
+  max: NODE_ENV === 'production'
+    ? 25
+    : 100,
+
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Juda ko\'p so\'rov. Bir daqiqa kuting.' },
+
+  message: {
+    error:
+      'Too many requests. Please wait a minute and try again.',
+  },
 });
-app.use('/api/', limiter);
 
-// ── System promptlar ──────────────────────────────
+app.use('/api', apiLimiter);
+
+// ───────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────
+
+function isValidLanguage(lang) {
+  return SUPPORTED_LANGUAGES.includes(lang);
+}
+
+function sanitizeText(text, maxLength = 2000) {
+  return String(text || '')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function createErrorResponse(message) {
+  return {
+    success: false,
+    error: message,
+  };
+}
+
+function createSuccessResponse(data) {
+  return {
+    success: true,
+    ...data,
+  };
+}
+// ───────────────────────────────────────────────────
+// AI Models
+// ───────────────────────────────────────────────────
+
+const AI_MODEL = 'claude-sonnet-4-20250514';
+
+// ───────────────────────────────────────────────────
+// System Prompts
+// ───────────────────────────────────────────────────
+
 const CHAT_SYSTEM = {
-  uz: `Sen HepatitCheck — O'zbekiston uchun gepatit ma'lumot tizimining AI yordamchisisan.
+  uz: `
+Sen HepatitCheck AI yordamchisisan.
 
-VAZIFANG:
-- Bemorlar va tibbiyot mutaxassislariga gepatit (A, B, C, D, E), jigar kasalliklari, laboratoriya tahlillari va davolash haqida aniq, ishonchli, tibbiy jihatdan to'g'ri ma'lumot berish.
+Ixtisoslashuv:
+- Gepatit A
+- Gepatit B
+- Gepatit C
+- Gepatit D
+- Gepatit E
+- Jigar sirrozi
+- Yog'li gepatoz
+- Jigar fermentlari
+- Virusli gepatit markerlari
+- Jigar laborator diagnostikasi
 
-QOIDALAR:
-1. Faqat savol tili va yo'nalishiga mos tilda javob ber
-2. Hech qachon aniq tibbiy tashxis qo'yma — faqat ma'lumot va yo'nalish ber
-3. Har doim javob oxirida: "⚠️ Aniq tashxis uchun shifokorga murojaat qiling."
-4. Javob hajmi: 3–5 qisqa paragraf yoki ro'yxat
-5. Oddiy, tushunarli til ishlat — tibbiy atamalarni tushuntir
-6. Markdown formatidan foydalanma — oddiy matn`,
+Qoidalar:
 
-  ru: `Ты AI-ассистент HepatitCheck — информационной системы по гепатиту для Узбекистана.
+1. Har doim foydalanuvchi tilida javob ber.
+2. Tibbiy jihatdan aniq va ishonchli ma'lumot ber.
+3. Hech qachon yakuniy tashxis qo'yma.
+4. Faqat ehtimoliy tushuntirish ber.
+5. Kerak bo'lsa laborator tekshiruvlarni tavsiya qil.
+6. Kerak bo'lsa infeksionist yoki gepatologga murojaat qilishni tavsiya qil.
+7. Murakkab atamalarni oddiy tushuntir.
+8. Javobni tartibli yoz.
+9. Markdown ishlatma.
+10. Har doim javob oxirida yoz:
 
-ТВОЯ ЗАДАЧА:
-- Давать пациентам и медицинским специалистам точную, достоверную, медицински корректную информацию о гепатите (A, B, C, D, E), заболеваниях печени, лабораторных анализах и лечении.
+⚠️ Ushbu javob ma'lumot berish uchun mo'ljallangan. Aniq tashxis va davolash uchun shifokorga murojaat qiling.
+`,
 
-ПРАВИЛА:
-1. Отвечай на языке вопроса
-2. Никогда не ставь конкретный медицинский диагноз — только информируй и направляй
-3. В конце каждого ответа: "⚠️ Для точного диагноза обратитесь к врачу."
-4. Объём ответа: 3–5 коротких абзацев или список
-5. Используй понятный язык — объясняй медицинские термины
-6. Не используй Markdown — только обычный текст`,
+  ru: `
+Ты HepatitCheck AI.
 
-  en: `You are the HepatitCheck AI assistant — a hepatitis information system for Uzbekistan.
+Специализация:
 
-YOUR TASK:
-- Provide patients and medical professionals with accurate, reliable, medically correct information about hepatitis (A, B, C, D, E), liver diseases, lab tests, and treatment.
+- Гепатит A
+- Гепатит B
+- Гепатит C
+- Гепатит D
+- Гепатит E
+- Цирроз печени
+- Жировая болезнь печени
+- Печёночные ферменты
+- Маркеры вирусных гепатитов
+- Лабораторная диагностика заболеваний печени
 
-RULES:
-1. Answer in the language of the question
-2. Never make a specific medical diagnosis — only inform and guide
-3. Always end with: "⚠️ For an accurate diagnosis, please consult a doctor."
-4. Answer length: 3–5 short paragraphs or a list
-5. Use plain language — explain medical terms
-6. Do not use Markdown — plain text only`,
+Правила:
+
+1. Отвечай на языке пользователя.
+2. Давай точную медицинскую информацию.
+3. Никогда не ставь окончательный диагноз.
+4. Объясняй возможные причины.
+5. При необходимости рекомендуй анализы.
+6. При необходимости рекомендуй консультацию гепатолога или инфекциониста.
+7. Используй понятный язык.
+8. Ответ должен быть структурированным.
+9. Не используй Markdown.
+10. Всегда заканчивай ответ:
+
+⚠️ Для точного диагноза и лечения обратитесь к врачу.
+`,
+
+  en: `
+You are HepatitCheck AI.
+
+Specialization:
+
+- Hepatitis A
+- Hepatitis B
+- Hepatitis C
+- Hepatitis D
+- Hepatitis E
+- Liver Cirrhosis
+- Fatty Liver Disease
+- Liver Enzymes
+- Viral Hepatitis Markers
+- Liver Laboratory Diagnostics
+
+Rules:
+
+1. Answer in the user's language.
+2. Provide medically accurate information.
+3. Never provide a definitive diagnosis.
+4. Explain possible causes.
+5. Recommend laboratory tests when appropriate.
+6. Recommend consultation with a hepatologist when necessary.
+7. Use clear language.
+8. Keep responses structured.
+9. Do not use Markdown.
+10. Always end with:
+
+⚠️ For an accurate diagnosis and treatment, consult a physician.
+`
 };
 
-const LAB_SYSTEM = `Sen tibbiy laboratoriya tahlillarini izohlash bo'yicha ixtisoslashgan AI yordamchisisan.
-Faqat gepatit va jigar kasalliklari bilan bog'liq tahlil natijalarini tahlil qilasan.
+// ───────────────────────────────────────────────────
+// Laboratory Analysis Prompt
+// ───────────────────────────────────────────────────
 
-QOIDALAR:
-1. Berilgan laboratoriya qiymatlarini mezon ko'rsatkichlar bilan solishtir
-2. Har bir ko'rsatkich uchun: normal/yuqori/past ekanligini aniqla
-3. Kompleks baholash qil — qaysi gepatit turi yoki jigar holati bilan mos kelishi mumkin
-4. Shifokorga murojaat qilish zarurligini aniqla
-5. Oddiy matn ishlat — Markdown yo'q
-6. Javob oxirida: "⚠️ Bu AI tahlili — shifokor tashxisini almashtirmaydi."
-7. O'zbek tilida javob ber (agar so'rov boshqa tilda bo'lsa — o'sha tilda)`;
+const LAB_SYSTEM = `
+You are an expert hepatology laboratory interpretation assistant.
 
-// ════════════════════════════════════════════════════
-//  ENDPOINTLAR
-// ════════════════════════════════════════════════════
+Tasks:
 
-// ── Health check ──────────────────────────────────
+1. Evaluate liver-related laboratory values.
+2. Compare results with standard reference ranges.
+3. Identify abnormal findings.
+4. Explain clinical significance.
+5. Discuss possible hepatitis-related implications.
+6. Mention possible liver diseases when relevant.
+7. Do NOT provide a final diagnosis.
+8. Explain findings in simple language.
+9. Be objective and evidence-based.
+
+Important:
+
+- ALT
+- AST
+- ALP
+- GGT
+- Bilirubin
+- Albumin
+- INR
+- HBsAg
+- Anti-HBs
+- HBeAg
+- Anti-HBe
+- Anti-HBc
+- HBV DNA
+- Anti-HCV
+- HCV RNA
+
+must be interpreted correctly whenever present.
+
+Always end with:
+
+⚠️ This AI interpretation does not replace physician evaluation.
+`;
+// ───────────────────────────────────────────────────
+// Health Routes
+// ───────────────────────────────────────────────────
+
 app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'HepatitCheck API',
-    version: '1.0.0',
-    endpoints: ['/api/chat', '/api/analyze', '/api/health'],
-  });
+  res.json(
+    createSuccessResponse({
+      service: 'HepatitCheck API',
+      version: '3.0.0',
+      status: 'online',
+      environment: NODE_ENV,
+      timestamp: new Date().toISOString(),
+    })
+  );
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json(
+    createSuccessResponse({
+      status: 'healthy',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+    })
+  );
 });
 
-// ── POST /api/chat ─────────────────────────────────
-// Bemorlar bilan AI suhbat
+// ───────────────────────────────────────────────────
+// AI Chat Endpoint
+// ───────────────────────────────────────────────────
+
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages, lang = 'uz' } = req.body;
+    const {
+      messages,
+      lang = 'uz',
+    } = req.body;
 
-    // Validatsiya
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'messages maydoni talab qilinadi' });
-    }
-    if (messages.length > 20) {
-      return res.status(400).json({ error: 'Suhbat juda uzun (max 20 xabar)' });
+    if (!isValidLanguage(lang)) {
+      return res
+        .status(400)
+        .json(
+          createErrorResponse(
+            'Unsupported language'
+          )
+        );
     }
 
-    // Faqat ruxsat etilgan maydonlarni qabul qilish
+    if (
+      !messages ||
+      !Array.isArray(messages)
+    ) {
+      return res
+        .status(400)
+        .json(
+          createErrorResponse(
+            'Messages array required'
+          )
+        );
+    }
+
+    if (
+      messages.length === 0 ||
+      messages.length > 20
+    ) {
+      return res
+        .status(400)
+        .json(
+          createErrorResponse(
+            'Conversation length invalid'
+          )
+        );
+    }
+
     const safeMessages = messages
-      .filter(m => m.role && m.content && typeof m.content === 'string')
+      .filter(
+        m =>
+          m &&
+          m.content &&
+          typeof m.content === 'string'
+      )
       .map(m => ({
-        role:    m.role === 'assistant' ? 'assistant' : 'user',
-        content: String(m.content).slice(0, 2000), // max 2000 belgi
+        role:
+          m.role === 'assistant'
+            ? 'assistant'
+            : 'user',
+
+        content: sanitizeText(
+          m.content,
+          2000
+        ),
       }));
 
-    const systemPrompt = CHAT_SYSTEM[lang] || CHAT_SYSTEM.uz;
+    const response =
+      await anthropic.messages.create({
+        model: AI_MODEL,
 
-    const response = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system:     systemPrompt,
-      messages:   safeMessages,
-    });
+        max_tokens: 1200,
 
-    res.json({ content: response.content });
+        temperature: 0.3,
 
-  } catch (err) {
-    console.error('[/api/chat]', err.message);
-    res.status(500).json({ error: 'AI xizmati vaqtincha ishlamayapti. Qayta urinib ko\'ring.' });
+        system:
+          CHAT_SYSTEM[lang],
+
+        messages: safeMessages,
+      });
+
+    const answer =
+      response.content?.[0]?.text ||
+      'No response generated';
+
+    return res.json(
+      createSuccessResponse({
+        content: answer,
+      })
+    );
+  } catch (error) {
+    console.error(
+      '[CHAT ERROR]',
+      error.message
+    );
+
+    return res
+      .status(500)
+      .json(
+        createErrorResponse(
+          'AI service temporarily unavailable'
+        )
+      );
   }
 });
 
-// ── POST /api/analyze ──────────────────────────────
-// Laboratoriya natijalarini AI tahlil qilishi
-app.post('/api/analyze', async (req, res) => {
-  try {
-    const { labs, lang = 'uz' } = req.body;
+// ───────────────────────────────────────────────────
+// Laboratory Analysis Endpoint
+// ───────────────────────────────────────────────────
 
-    if (!labs || typeof labs !== 'object') {
-      return res.status(400).json({ error: 'labs maydoni talab qilinadi' });
+app.post(
+  '/api/analyze',
+  async (req, res) => {
+    try {
+      const {
+        labs,
+        lang = 'uz',
+      } = req.body;
+
+      if (!labs) {
+        return res
+          .status(400)
+          .json(
+            createErrorResponse(
+              'Laboratory values required'
+            )
+          );
+      }
+
+      const labText =
+        Object.entries(labs)
+          .filter(
+            ([, value]) =>
+              value !== undefined &&
+              value !== null &&
+              value !== ''
+          )
+          .map(
+            ([key, value]) =>
+              `${key}: ${value}`
+          )
+          .join('\n');
+
+      if (!labText) {
+        return res
+          .status(400)
+          .json(
+            createErrorResponse(
+              'No laboratory values provided'
+            )
+          );
+      }
+
+      const prompt = `
+Language: ${lang}
+
+Interpret these liver and hepatitis laboratory results:
+
+${labText}
+
+Provide:
+1. Abnormal findings
+2. Clinical meaning
+3. Hepatitis relevance
+4. Recommended next steps
+`;
+
+      const response =
+        await anthropic.messages.create({
+          model: AI_MODEL,
+
+          max_tokens: 1500,
+
+          temperature: 0.2,
+
+          system: LAB_SYSTEM,
+
+          messages: [
+            {
+              role: 'user',
+              content: prompt,
+            },
+          ],
+        });
+
+      const result =
+        response.content?.[0]?.text ||
+        'Analysis unavailable';
+
+      return res.json(
+        createSuccessResponse({
+          content: result,
+        })
+      );
+    } catch (error) {
+      console.error(
+        '[LAB ERROR]',
+        error.message
+      );
+
+      return res
+        .status(500)
+        .json(
+          createErrorResponse(
+            'Laboratory analysis unavailable'
+          )
+        );
     }
-
-    // Tahlil natijalarini matn ko'rinishiga o'tkazish
-    const labText = Object.entries(labs)
-      .filter(([, v]) => v !== null && v !== undefined && v !== '')
-      .map(([k, v]) => `${k}: ${v}`)
-      .join('\n');
-
-    if (!labText) {
-      return res.status(400).json({ error: 'Hech bo\'lmaganda bitta tahlil natijasi kiriting' });
-    }
-
-    const prompt = `Quyidagi laboratoriya tahlil natijalarini baholang va gepatit yoki jigar kasalligi nuqtai nazaridan izohlang:\n\n${labText}\n\nTil: ${lang}`;
-
-    const response = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 1200,
-      system:     LAB_SYSTEM,
-      messages:   [{ role: 'user', content: prompt }],
-    });
-
-    res.json({ content: response.content });
-
-  } catch (err) {
-    console.error('[/api/analyze]', err.message);
-    res.status(500).json({ error: 'Tahlil xizmati vaqtincha ishlamayapti.' });
   }
-});
+);
 
-// ── 404 ───────────────────────────────────────────
+// ───────────────────────────────────────────────────
+// 404 Handler
+// ───────────────────────────────────────────────────
+
 app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint topilmadi' });
+  return res.status(404).json(
+    createErrorResponse(
+      'Endpoint not found'
+    )
+  );
 });
 
-// ── Global error handler ──────────────────────────
-app.use((err, req, res, _next) => {
-  console.error('[Server Error]', err.message);
-  res.status(500).json({ error: 'Server xatosi' });
-});
+// ───────────────────────────────────────────────────
+// Global Error Handler
+// ───────────────────────────────────────────────────
 
-// ── Start ─────────────────────────────────────────
-app.listen(port, () => {
-  console.log(`\n✅ HepatitCheck API ishga tushdi`);
-  console.log(`   Port     : ${port}`);
-  console.log(`   Origins  : ${ALLOWED_ORIGINS.join(', ') || 'barchasi (dev rejim)'}`);
-  console.log(`   Model    : claude-sonnet-4-6\n`);
+app.use(
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
+    console.error(
+      '[GLOBAL ERROR]',
+      err
+    );
+
+    return res.status(500).json(
+      createErrorResponse(
+        'Internal server error'
+      )
+    );
+  }
+);
+
+// ───────────────────────────────────────────────────
+// Start Server
+// ───────────────────────────────────────────────────
+
+app.listen(PORT, () => {
+  console.log('');
+  console.log(
+    '════════════════════════════════════'
+  );
+  console.log(
+    '🚀 HepatitCheck API Started'
+  );
+  console.log(
+    '════════════════════════════════════'
+  );
+  console.log(
+    `Environment : ${NODE_ENV}`
+  );
+  console.log(
+    `Port        : ${PORT}`
+  );
+  console.log(
+    `Languages   : ${SUPPORTED_LANGUAGES.join(', ')}`
+  );
+  console.log(
+    `Origins     : ${
+      ALLOWED_ORIGINS.join(', ') ||
+      'All'
+    }`
+  );
+  console.log(
+    `Started At  : ${new Date().toISOString()}`
+  );
+  console.log(
+    '════════════════════════════════════'
+  );
+  console.log('');
 });
