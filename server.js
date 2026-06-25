@@ -10,8 +10,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const Anthropic = require('@anthropic-ai/sdk');
-
+const Anthropic = require("@anthropic-ai/sdk").default;
 const app = express();
 
 // ───────────────────────────────────────────────────
